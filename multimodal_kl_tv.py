@@ -42,33 +42,57 @@ elif ndim == 3:
 ray_trafo = odl.tomo.RayTransform(space, geometry, impl='astra_cuda')
 
 # Create phantom
-ellipses = odl.phantom.shepp_logan_ellipses(ndim, modified=True)[::4]
+phantom_type = 'circles'
+if phantom_type == 'shepp_logan':
+    ellipses = odl.phantom.shepp_logan_ellipses(ndim, modified=True)[::4]
 
-domain = odl.ProductSpace(space, len(ellipses))
-phantom = domain.element([odl.phantom.ellipse_phantom(space, [e])
-                          for e in ellipses])
-phantom = phantom.ufunc.absolute()
+    domain = odl.ProductSpace(space, len(ellipses))
+    phantom = domain.element([odl.phantom.ellipse_phantom(space, [e])
+                              for e in ellipses])
+    phantom = phantom.ufunc.absolute()
+elif phantom_type == 'circles':
+    ellipses = [[1, 0.8, 0.8, 0, 0, 0],
+                [1, 0.4, 0.4, 0.2, 0.2, 0]]
+
+    domain = odl.ProductSpace(space, len(ellipses))
+    phantom = domain.element()
+    phantom[0] = odl.phantom.ellipse_phantom(space, [ellipses[0]])
+    phantom[1] = odl.phantom.ellipse_phantom(space, [ellipses[1]])
+    phantom[0] -= phantom[1]
+
 phantom.show('phantom', indices=np.s_[:])
 
 diagop = odl.DiagonalOperator(ray_trafo, domain.size)
 redop = odl.ReductionOperator(ray_trafo, domain.size)
 
-# Assemble all operators
-data = diagop(phantom)
-data_sum = redop(phantom)
-
 # gradient
 grad = odl.Gradient(ray_trafo.domain)
 grad_n = odl.DiagonalOperator(grad, domain.size)
 
-# Create functionals as needed
-f = odl.solvers.IndicatorNonnegativity(domain)
+# Create data
+data = diagop(phantom)
+data_sum = redop(phantom)
 
+# Add noise to data
+scale_poisson = 1 / np.mean(data)  # 1 quanta per pixel, on avg
+data += odl.phantom.poisson_noise(data * scale_poisson) / scale_poisson
+
+scale_white_noise = 0.1 * np.mean(data_sum)  # 10% white noise
+data_sum += odl.phantom.white_noise(data_sum.space) * scale_white_noise
+
+# Create box constraint functional
+f = odl.solvers.IndicatorBox(domain, 0, 1)
+
+# Create data discrepancy functionals
 alpha = 0.8
 g_kl = [(1 - alpha) * odl.solvers.KullbackLeibler(ray_trafo.range, prior=d)
         for d in data]
 g_l2 = alpha * odl.solvers.L2NormSquared(ray_trafo.range).translated(data_sum)
-g_l1 = [0.01 * odl.solvers.L1Norm(grad.range) for i in range(domain.size)]
+
+# Create L1 functional for the TV regularization
+g_l1 = [0.2 * odl.solvers.L1Norm(grad.range)] * domain.size
+
+# Assemble functionals
 g = [odl.solvers.SeparableSum(*g_kl),
      g_l2,
      odl.solvers.SeparableSum(*g_l1)]
